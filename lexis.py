@@ -2,18 +2,24 @@ import re
 import json
 import os
 import os.path
-import helper
 import logging
 import time
 import sys
+from Queue import Queue
+from ConfigParser import SafeConfigParser
 
 # 3rd party libraries
 import requests
 from bs4 import BeautifulSoup
 
-import pprint
-
 import lexisparser
+from helper import *
+import rabbitcoat
+import pygres
+
+# Turn down requests and pika logging
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("pika").setLevel(logging.WARNING)
 
 # BeautifulSoup made problems for large documents.
 MAX_RECURSION = 3000
@@ -77,17 +83,44 @@ def saveOut(name, cont):
     
 class LexisNexis(object):
     
-    def __init__(self):
-        self.logger = helper.getLogger(logging.INFO)
-        self.config = helper.Config()
+    def __init__(self, config='conf/lexis.conf', rabbit_config='conf/rabbitcoat.conf', pygres_config='conf/pygres.conf'):
+        self.logger = getLogger('lexis')
+        self.logger.info('Initializing lexis searcher')
+        
+        self.__loadConfig(config)
+        
+        self.db_articles = pygres.PostgresArticles()
         
         self.s = requests.session()
         self.s.verify = False
         
         self.s.headers = HEADERS
+        
+        self.queries = Queue()
+        
+        self.sender = self.sender = rabbitcoat.RabbitSender(self.logger, rabbit_config, self.out_queue)
+        
+        self.__login()
+
+        self.receiver = rabbitcoat.RabbitReceiver(self.logger, rabbit_config, self.in_queue, self.__rabbitCallback)
+        self.receiver.start()       
     
-    def Login(self):
+    def __loadConfig(self, config):
+        parser = SafeConfigParser()
+        parser.read(config)
+        
+        self.username = parser.get('LEXIS', 'username')
+        self.password = parser.get('LEXIS', 'password')
+        
+        self.result_count = parser.getint('LEXIS', 'result_count')
+        
+        self.in_queue = parser.get('LEXIS', 'in_queue')
+        self.out_queue = parser.get('LEXIS', 'out_queue')
+    
+    def __login(self):
         ''' Login into dowjones '''
+        self.logger.info('Logging into the site')
+        
         form_url = '/dd'
         login_url = 'https://www.lexisnexis.com/dd/auth/srhandler.do'
         
@@ -96,13 +129,13 @@ class LexisNexis(object):
         data = {
             'dispatch': 'signon',
             'originSignonForm': 'signonform',
-            'webId': self.config.username,
-            'password': self.config.password,
+            'webId': self.username,
+            'password': self.password,
             'permanent': 'false',
         }
         res = self.s.post(login_url, data)
     
-    def AddTerms(self, data, additional_terms, connectors):
+    def __addTerms(self, data, additional_terms, connectors):
     
         # Convert to tuple
         if type(additional_terms) == str:
@@ -145,7 +178,7 @@ class LexisNexis(object):
         data['firstName'] = first_name
         data['surName'] = last_name
         
-        self.AddTerms(data, additional_terms, connectors)
+        self.__addTerms(data, additional_terms, connectors)
         
         res = self.s.post(MAIN_URL + search_url, data)
 
@@ -155,56 +188,79 @@ class LexisNexis(object):
         search_key = soup.find('input', {'name':'srchFormBeanKey'})['value'].strip()
         bean_key = soup.find('input', {'name':'formBeanKey'})['value'].strip()
         
-        # Not sure why if needed
-        #self.CountSearch(search_key)
-        #self.ResClass(risb, bean_key)
-        
-        result_html = ''
+        results = []
         for page in PAGES:
-            table = self.GetPage(page, search_key, bean_key)
-            result_html += table
+            docs, total = self.__getDocs(page, search_key, bean_key)
+            for url, title in docs:
+                id = self.__getDocument(url)
+                result = { ID_KEY:id,
+                           SOURCE_KEY: PAGES[page],
+                           QUERY_KEY: '%s %s' %(first_name, last_name),
+                           TITLE_KEY: title }
+                results.append(result)
         
-        docs = lexisparser.getDocUrls(result_html)
-        
-        i = 0
-        for doc in docs:
-            name = 'doc%s.html' %i
-            cont = self.GetDocument(doc)
-            
-            saveOut(name, cont)
-            print result_html.find(doc.replace('&', '&amp;'))
-            result_html = result_html.replace(doc.replace('&', '&amp;'), name)
-            i += 1
-            
-        saveOut('out.html', HTML_STRUCTURE %result_html)
-            
-    def GetPage(self, page, search_key, bean_key):
-        print search_key, bean_key
+        return results
+    
+    def __getDocs(self, page, search_key, bean_key):
+        '''
+        Get the docs in this page        
+        '''
         result_page = '/dd/results/ResultTabHandler.do?selectedTab=%s&selectedMainTab=&searchFormKey=%s&rsltListFormKey=%s&taggedValues=undefined&tertiaryTabSelected=&negnewsLvlSelected=0'
         
         res = self.s.post(MAIN_URL + result_page %(page, search_key, bean_key), 
                           {'focusTerms' : ''})
         
-        table = lexisparser.getSearchResults(PAGES[page], res.text, self.config.result_count)
+        docs, total = lexisparser.getDocUrls(res.text, self.result_count)
         
-        return table
+        return docs, total
 
-    def GetDocument(self, url):
+    def __getDocument(self, url):
+        self.logger.debug('Getting document %s' %url)
+    
         res = self.s.get(MAIN_URL + url)
-        
-        saveOut('temp.html', res.text)
         
         soup = BeautifulSoup(res.text)
         
         elem = soup.find(id='formReplicate').find(class_='resultsTopList')
         
-        return elem.prettify()
+        # id = 1
+        id = self.db_articles.AddArticle(str(elem), ArticleSources.LEXIS)
+        
+        return id
+    
+    def __sendResults(self, results):
+        self.logger.debug('Sending results to manager')
+        self.sender.Send(results, corr_id = self.corr_id)
+    
+    def __rabbitCallback(self, data, properties):
+        self.logger.debug('Received search request: %s, %s' %(data, properties))
+        if not data.has_key(FIRST_NAME_PARAM) or not data.has_key(LAST_NAME_PARAM):
+            self.logger.debug('No first/last name in query %s, ignoring')
+            return
+            
+        first_name = data[FIRST_NAME_PARAM]
+        last_name = data[LAST_NAME_PARAM]
+        
+        #TODO: Add original name        
+        self.queries.put((first_name, last_name, properties.correlation_id))        
+    
+    def run(self):
+        self.logger.info('Starting main query loop')
+        
+        while True:
+            # Since only one query is running at a time, self.corr_id is fine
+            first, last, self.corr_id = self.queries.get()
+            self.logger.info('Starting query %s %s' %(first, last))
+            results = self.Query(first, last)
+            json_results = json.dumps(results)
+            
+            self.logger.info('Sending query results \'%s %s\' to %s' %(first, last, self.out_queue))
+
+            self.__sendResults(json_results)
         
 def main():
     lexis = LexisNexis()
-    lexis.Login()
-    
-    lexis.Query('binyamin', 'netanyahu', source = Sources.ALL, duplicate_filter = DuplicateFilter.MODERATE)
+    lexis.run()
     
 if __name__ == '__main__':
     main()
