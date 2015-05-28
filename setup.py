@@ -5,5 +5,5 @@ setup(name='lexis',
       description='lexis searching gear',
       author='Koby Bass',
       author_email='kobybum@gmail.com.com',
-      install_requires=['psycopg2','pika','requests','beautifulsoup4'],
+      install_requires=['psycopg2','pika','requests','beautifulsoup4','chardet'],
      )

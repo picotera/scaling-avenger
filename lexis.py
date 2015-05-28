@@ -1,5 +1,4 @@
 import re
-import json
 import os
 import os.path
 import logging
@@ -52,6 +51,8 @@ ADDITIONAL_CONNECTOR = 'additionalTermsConnector%s'
          
 MAIN_URL = 'http://www.lexisnexis.com'
 
+LOGIN_INTERVAL = 15*60
+
 class DuplicateFilter(object):
     OFF = 'search.common.threshold.off'
     HIGH = 'search.common.threshold.narrowrange'
@@ -83,13 +84,17 @@ def saveOut(name, cont):
     
 class LexisNexis(object):
     
+    doc_retries = 3
+    total_retries = 5
+    retry_sleep = 60
+    
     def __init__(self, config='conf/lexis.conf', rabbit_config='conf/rabbitcoat.conf', pygres_config='conf/pygres.conf'):
         self.logger = getLogger('lexis')
         self.logger.info('Initializing lexis searcher')
         
         self.__loadConfig(config)
         
-        self.db_articles = pygres.PostgresArticles()
+        self.db_articles = pygres.PostgresArticles(self.logger, pygres_config)
         
         self.s = requests.session()
         self.s.verify = False
@@ -99,8 +104,8 @@ class LexisNexis(object):
         self.queries = Queue()
         
         self.sender = self.sender = rabbitcoat.RabbitSender(self.logger, rabbit_config, self.out_queue)
-        
-        self.__login()
+                
+        self.last_login = 0
 
         self.receiver = rabbitcoat.RabbitReceiver(self.logger, rabbit_config, self.in_queue, self.__rabbitCallback)
         self.receiver.start()       
@@ -118,7 +123,12 @@ class LexisNexis(object):
         self.out_queue = parser.get('LEXIS', 'out_queue')
     
     def __login(self):
-        ''' Login into dowjones '''
+        # No need to login
+        if time.time() - self.last_login < LOGIN_INTERVAL:
+            return
+        
+        self.last_login = time.time()
+        
         self.logger.info('Logging into the site')
         
         form_url = '/dd'
@@ -154,7 +164,7 @@ class LexisNexis(object):
             data[ADDITIONAL_TERM %(i+1)] = additional_terms[i]
             data[ADDITIONAL_CONNECTOR %(i+1)] = connector
     
-    def Query(self, first_name, last_name, additional_terms=(), connectors=(), source=Sources.ALL, duplicate_filter=DuplicateFilter.MODERATE):
+    def __query(self, first_name, last_name, additional_terms=(), connectors=(), source=Sources.ALL, duplicate_filter=DuplicateFilter.MODERATE):
         '''
         @param source: A source specification from Sources
         @param additional: Additional terms
@@ -162,10 +172,15 @@ class LexisNexis(object):
         @param connectors: The connectors between the terms. AND_CONNECTOR/OR_CONNECTOR, default or
         @type connectors: list/tuple(str) or str
         '''
+        # Check that we're logged in
+        self.__login()
+        
         base_url = '/dd/auth/checkbrowser.do?t=%s&bhcp=1&bhqs=1'
         search_url = '/dd/search/submitForm.do'
 
         res = self.s.get(MAIN_URL + base_url %int(time.time() * 1000))
+        
+        open('res', 'w').write(res.text.encode('utf8'))
         
         soup = BeautifulSoup(res.text)
         
@@ -188,11 +203,19 @@ class LexisNexis(object):
         search_key = soup.find('input', {'name':'srchFormBeanKey'})['value'].strip()
         bean_key = soup.find('input', {'name':'formBeanKey'})['value'].strip()
         
+        retries = 0
         results = []
         for page in PAGES:
-            docs, total = self.__getDocs(page, search_key, bean_key)
+            docs, total = self.__getDocUrls(page, search_key, bean_key)
             for url, title in docs:
                 id = self.__getDocument(url)
+                if id == None:
+                    retries += 1
+                    #TODO: debug this
+                    if retries >= self.total_retries:
+                        self.logger.error('%s documents failed, aborting' %retries)
+                        return []
+                
                 result = { ID_KEY:id,
                            SOURCE_KEY: PAGES[page],
                            QUERY_KEY: '%s %s' %(first_name, last_name),
@@ -200,10 +223,10 @@ class LexisNexis(object):
                 results.append(result)
         
         return results
-    
-    def __getDocs(self, page, search_key, bean_key):
+        
+    def __getDocUrls(self, page, search_key, bean_key):
         '''
-        Get the docs in this page        
+        Get the docs in this page
         '''
         result_page = '/dd/results/ResultTabHandler.do?selectedTab=%s&selectedMainTab=&searchFormKey=%s&rsltListFormKey=%s&taggedValues=undefined&tertiaryTabSelected=&negnewsLvlSelected=0'
         
@@ -215,18 +238,31 @@ class LexisNexis(object):
         return docs, total
 
     def __getDocument(self, url):
-        self.logger.debug('Getting document %s' %url)
-    
-        res = self.s.get(MAIN_URL + url)
-        
-        soup = BeautifulSoup(res.text)
-        
-        elem = soup.find(id='formReplicate').find(class_='resultsTopList')
-        
-        # id = 1
-        id = self.db_articles.AddArticle(str(elem), ArticleSources.LEXIS)
-        
-        return id
+        retries = 0
+        while True:
+            try:
+                self.logger.debug('Getting document %s' %url)
+            
+                res = self.s.get(MAIN_URL + url)
+                
+                soup = BeautifulSoup(res.text)
+                
+                elem = soup.find(id='formReplicate').find(class_='resultsTopList')
+                
+                # id = 1
+                id = self.db_articles.AddArticle(str(elem), ArticleSources.LEXIS)
+                
+                return id
+            except AttributeError:
+                # Happens when we ask too much from the server
+                retries += 1
+                if retries >= self.doc_retries:
+                    self.logger.exception('Tried getting article %s times: %s' %(self.retries, url))
+                    #TODO: Remove this, debugging
+                    if soup:
+                        open('/var/lib/openshift/55586377e0b8cddc9000006c/app-root/logs/out', 'w').write(str(soup))
+                    return None
+                time.sleep(retry_sleep)
     
     def __sendResults(self, results):
         self.logger.debug('Sending results to manager')
@@ -249,14 +285,17 @@ class LexisNexis(object):
         
         while True:
             # Since only one query is running at a time, self.corr_id is fine
-            first, last, self.corr_id = self.queries.get()
-            self.logger.info('Starting query %s %s' %(first, last))
-            results = self.Query(first, last)
-            json_results = json.dumps(results)
-            
-            self.logger.info('Sending query results \'%s %s\' to %s' %(first, last, self.out_queue))
+            try:
+                first, last, self.corr_id = self.queries.get()
+                self.logger.info('Starting query %s %s' %(first, last))
 
-            self.__sendResults(json_results)
+                results = self.__query(first, last)
+                
+                self.logger.info('Sending query results \'%s %s\' to %s' %(first, last, self.out_queue))
+
+                self.__sendResults(results)
+            except Exception:
+                self.logger.exception('Exception in query %s %s' %(first, last))
         
 def main():
     lexis = LexisNexis()
