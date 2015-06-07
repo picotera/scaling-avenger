@@ -84,9 +84,9 @@ def saveOut(name, cont):
     
 class LexisNexis(object):
     
-    doc_retries = 3
-    total_retries = 5
-    retry_sleep = 60
+    doc_retries = 2
+    total_retries = 3
+    retry_sleep = 30
     
     def __init__(self, config='conf/lexis.conf', rabbit_config='conf/rabbitcoat.conf', pygres_config='conf/pygres.conf'):
         self.logger = getLogger('lexis')
@@ -214,7 +214,7 @@ class LexisNexis(object):
                     #TODO: debug this
                     if retries >= self.total_retries:
                         self.logger.error('%s documents failed, aborting' %retries)
-                        return []
+                        return None
                 
                 result = { ID_KEY:id,
                            SOURCE_KEY: PAGES[page],
@@ -250,7 +250,7 @@ class LexisNexis(object):
                 elem = soup.find(id='formReplicate').find(class_='resultsTopList')
                 
                 # id = 1
-                id = self.db_articles.AddArticle(str(elem), ArticleSources.LEXIS)
+                id = self.db_articles.AddArticle(str(elem), SearchEngines.LEXIS)
                 
                 return id
             except AttributeError:
@@ -258,14 +258,18 @@ class LexisNexis(object):
                 retries += 1
                 if retries >= self.doc_retries:
                     self.logger.exception('Tried getting article %s times: %s' %(self.retries, url))
-                    #TODO: Remove this, debugging
-                    if soup:
-                        open('/var/lib/openshift/55586377e0b8cddc9000006c/app-root/logs/out', 'w').write(str(soup))
                     return None
                 time.sleep(retry_sleep)
     
-    def __sendResults(self, results):
-        self.logger.debug('Sending results to manager')
+    def __sendResults(self, results=None, query=None, error=None):
+        '''Sends the results to the next gear.'''
+        if error:
+            results = {ERROR_KEY: error}
+        elif query == None or results == None:
+            self.logger.error("Can't send results: %s, %s" %(results, quer))
+        else:
+            results = {RESULTS_KEY: results, QUERY_KEY: query}
+            
         self.sender.Send(results, corr_id = self.corr_id)
     
     def __rabbitCallback(self, data, properties):
@@ -278,7 +282,7 @@ class LexisNexis(object):
         last_name = data[LAST_NAME_PARAM]
         
         #TODO: Add original name        
-        self.queries.put((first_name, last_name, properties.correlation_id))        
+        self.queries.put((first_name, last_name, data, properties.correlation_id))        
     
     def run(self):
         self.logger.info('Starting main query loop')
@@ -286,16 +290,18 @@ class LexisNexis(object):
         while True:
             # Since only one query is running at a time, self.corr_id is fine
             try:
-                first, last, self.corr_id = self.queries.get()
+                first, last, query, self.corr_id = self.queries.get()
                 self.logger.info('Starting query %s %s' %(first, last))
 
                 results = self.__query(first, last)
+                if results == None: # If an error happened, let the client know
+                    self.__sendResults(error='Retry limit passed, failed to finish search')
                 
                 self.logger.info('Sending query results \'%s %s\' to %s' %(first, last, self.out_queue))
-
-                self.__sendResults(results)
+                self.__sendResults(results, query)
             except Exception:
                 self.logger.exception('Exception in query %s %s' %(first, last))
+                self.sendResults(error='Exception while searching')
         
 def main():
     lexis = LexisNexis()

@@ -1,7 +1,7 @@
 import psycopg2
 import os
 from threading import Lock
-import chardet
+import time
 
 from helper import *
 
@@ -15,6 +15,24 @@ DEFAULT_CONF = 'conf/pygres.conf'
 ENCODING = 'encoding'
 
 CONFIG_SECTION = 'POSTGRESQL'
+
+EXCEPTION_SLEEP = 60
+def handle_excepts(inner_f):
+    def _inner_f(self, *args, **kwargs):
+        try:
+            while True:
+                try:
+                    return inner_f(self, *args, **kwargs)
+                except psycopg2.OperationalError:
+                    self.logger.exception('Caught OperationError, sleeping and reconnecting')
+                    time.sleep(EXCEPTION_SLEEP)
+                    self._connect()
+        except Exception:
+            self.logger.exception("Exception on db action: %s" %(args,))
+            return None
+            
+    return _inner_f
+
 class PostgresConnection(object):
     '''
     A generic class of connections, in case we'll have more inheritants
@@ -23,7 +41,7 @@ class PostgresConnection(object):
         self.logger = logger
     
         self.__loadConfig(config)
-        self.__connect()
+        self._connect()
         self.lock = Lock()
     
         # This will drop the existing table!
@@ -55,7 +73,7 @@ class PostgresConnection(object):
         WARNING: All connections to the DB must be closed first.
         '''
         self.cur.execute('DROP TABLE IF EXISTS %s' %ARTICLES_TABLE)
-        self.cur.execute('CREATE TABLE %s(id serial, source int2, encoding varchar(20), data bytea)' %ARTICLES_TABLE)
+        self.cur.execute('CREATE TABLE %s(id serial, source varchar(8), data bytea)' %ARTICLES_TABLE)
 
         # A table to save searches
         #TODO: Add indexing to search ID?
@@ -64,13 +82,14 @@ class PostgresConnection(object):
         
         self.con.commit()
     
-    def __connect(self):
+    def _connect(self):
         '''
         Connect to the database
         '''
         self.con = psycopg2.connect(host=self.host, port=self.port, database=self.database, user=self.user, password=self.password)
         self.cur = self.con.cursor()
     
+    @handle_excepts
     def _getByValue(self, table, value_name, value, keys=None):
         query = 'SELECT * from %s WHERE %s=' %(table, value_name)
         query += '%s'
@@ -100,39 +119,27 @@ class PostgresArticles(PostgresConnection):
         PostgresConnection.__init__(self, logger, config, setup)
         # Do stuff?
     
+    @handle_excepts
     def AddArticle(self, data, source):
-        '''
-        if type(source) != int or source > 2 ** 8:
-            # Invalid source
-            return
-        ''' 
-        try:
-            data = bytes(data)
-            encoding = chardet.detect(data)[ENCODING]
-
-            query = 'INSERT INTO %s' %ARTICLES_TABLE
-            query += ' (source,encoding,data) VALUES(%s,%s,%s) RETURNING id'
-            with self.lock:
-                self.cur.execute(query, (source, encoding, psycopg2.Binary(data)))
-                id = self.cur.fetchone()[0]
-                self.con.commit()
-        except Exception:
-            self.logger.exception("Exception adding article")
-            return None
+        query = 'INSERT INTO %s' %ARTICLES_TABLE
+        query += ' (source,data) VALUES(%s,%s) RETURNING id'
+        with self.lock:
+            self.cur.execute(query, (source, psycopg2.Binary(data)))
+            id = self.cur.fetchone()[0]
+            self.con.commit()
         
         return id
-        
+    
     def GetArticle(self, id):
-        try:
-            data = self._getById(ARTICLES_TABLE, id, keys=(ID_KEY, SOURCE_KEY, ENCODING, DATA_KEY))
-            data[DATA_KEY] = str(data[DATA_KEY])
-            return data
-        except Exception:
-            self.logger.exception("Exception getting article %s" %(id, ))
+        data = self._getById(ARTICLES_TABLE, id, keys=(ID_KEY, SOURCE_KEY, DATA_KEY))
+        if not data:
             return None
+        fixed_data = data.get(DATA_KEY)
+        if not fixed_data:
+            self.logger.exception("No data key in article %s'" %(data,))
         
-        #return unicode(str(data[DATA_KEY]), data[ENCODING])
-        #return self._getById(ARTICLES_TABLE, id, keys=(ID_KEY, SOURCE_KEY, DATA_KEY))        
+        data[DATA_KEY] = str(fixed_data)
+        return data     
         
 class PostgresManager(PostgresArticles):
     '''
@@ -141,29 +148,23 @@ class PostgresManager(PostgresArticles):
     def __init_(self, logger, config=DEFAULT_CONF, setup=False):
         PostgresArticles.__init__(self, logger, config, setup)
         
+    @handle_excepts
     def SaveSearch(self, search_id, search_query, results):
-        try:
-            query = 'INSERT INTO %s' %SEARCHES_TABLE
-            query += ' (search_id, query, results) VALUES(%s,%s,%s) RETURNING id'
-            with self.lock:
-                self.cur.execute(query, (search_id, search_query, results))
-                id = self.cur.fetchone()[0]
-                self.con.commit()
-            
-            return id
-        except Exception:
-            self.logger.exception('Error saving search %s' %(search_id, search_query))
-            return None
+        query = 'INSERT INTO %s' %SEARCHES_TABLE
+        query += ' (search_id, query, results) VALUES(%s,%s,%s) RETURNING id'
+        with self.lock:
+            self.cur.execute(query, (search_id, search_query, results))
+            id = self.cur.fetchone()[0]
+            self.con.commit()
+        
+        return id
         
     def GetSearch(self, search_id):
-        try:
-            return self._getByValue(SEARCHES_TABLE, 'search_id', search_id, keys=(None, ID_KEY, QUERY_KEY, RESULTS_KEY))
-        except Exception:
-            self.logger.exception('Exception getting search %s' %(search_id,))
+        return self._getByValue(SEARCHES_TABLE, 'search_id', search_id, keys=(None, ID_KEY, QUERY_KEY, RESULTS_KEY))
         
 def main():
     postgres = PostgresManager(getLogger('pygres'), setup=True)
-    id = postgres.AddArticle(ur"1) As you enter through the Shaded Woods door (after <producing the symbol of the King by wearing the King's Ring) on left is a corpse with Soul of a Nameless Soldier and Petrified Dragon Bone. To the right behind stairs in corner, is a corpse with Fire Seed. Another corpse near the tall grass has Poison Throwing Knife x10. There is a roaming pack of dogs in the tall grass that inflict bleed and petrification. In the grass is a corpse in with Alluring Skull x3. If you follow the ridge to the left you come across a mimic chest. Attack it and kill it to get Sunset Staff and Dark Mask. In a little wooden hut nearby is a the Foregarden bonfire. You may meet Lucatiel of Mirrah here, and if you kept her alive during three earlier boss fights, she will give you her sword and armor (Mirrah Greatsword, Lucatiel's Set).", 1)
+    id = postgres.AddArticle("1) As you enter through the Shaded Woods door (after <producing the symbol of the King by wearing the King's Ring) on left is a corpse with Soul of a Nameless Soldier and Petrified Dragon Bone. To the right behind stairs in corner, is a corpse with Fire Seed. Another corpse near the tall grass has Poison Throwing Knife x10. There is a roaming pack of dogs in the tall grass that inflict bleed and petrification. In the grass is a corpse in with Alluring Skull x3. If you follow the ridge to the left you come across a mimic chest. Attack it and kill it to get Sunset Staff and Dark Mask. In a little wooden hut nearby is a the Foregarden bonfire. You may meet Lucatiel of Mirrah here, and if you kept her alive during three earlier boss fights, she will give you her sword and armor (Mirrah Greatsword, Lucatiel's Set).", 1)
 
     print 'id %s' %id
     data = postgres.GetArticle(id)
